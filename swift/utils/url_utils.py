@@ -24,10 +24,12 @@ class SafeUrlFetcher:
     hop at a time so that a public URL cannot bounce the request into the internal network. Two environment
     variables relax the checks for trusted setups:
 
-    - `SWIFT_ALLOW_INTERNAL_URL=1`: allow private/loopback addresses, e.g. an internal image server used by
-      an offline training job. Cloud metadata endpoints stay blocked.
-    - `SWIFT_URL_ALLOWED_HOSTS=host1,host2`: only fetch from these hosts, and trust them regardless of the
-      addresses they resolve to. Recommended when a deployment serves media from a known bucket domain.
+    - `SWIFT_ALLOW_INTERNAL_URL=1`: allow private/loopback addresses, e.g. a trusted internal media server
+      used by a deployment. Cloud metadata endpoints stay blocked.
+    - `SWIFT_URL_ALLOWED_HOSTS=host1,host2`: only fetch from these hosts. They may resolve to ordinary private
+      addresses, but cloud metadata addresses remain blocked. Recommended for a known media bucket domain.
+    - `SWIFT_MAX_DOWNLOAD_SIZE_MB`: cap on the response body, so that a caller cannot exhaust memory (and,
+      for video, disk) by pointing the server at an endless response. Set to `0` to disable the cap.
 
     Note that a host resolved here is resolved again by the OS when the connection is made, so a DNS entry
     that changes between the two (DNS rebinding) is not covered; use `SWIFT_URL_ALLOWED_HOSTS` plus an egress
@@ -36,6 +38,8 @@ class SafeUrlFetcher:
     ALLOWED_SCHEMES = ('http', 'https')
     MAX_REDIRECTS = 5
     RETRY_TOTAL = 3
+    CHUNK_SIZE = 1024 * 1024
+    DEFAULT_MAX_DOWNLOAD_SIZE_MB = 1024
     # Cloud instance metadata services, reachable from inside virtually every cloud VM and container and
     # holding short-lived credentials for the whole account, so they are blocked unconditionally.
     # 169.254.0.0/16: AWS/Azure/GCP/Huawei (and Tencent's metadata.tencentyun.com); 100.100.100.200: Alibaba
@@ -45,28 +49,65 @@ class SafeUrlFetcher:
         ipaddress.ip_network(network) for network in ('169.254.0.0/16', '100.100.100.200/32', 'fd00:ec2::254/128'))
 
     @classmethod
-    def get(cls, url: str, **kwargs) -> requests.Response:
-        """`requests.get`, but every hop of the request is checked by `check_url` first."""
+    def read(cls, url: str, **kwargs) -> bytes:
+        """Fetch `url` and return its body, checking every hop with `check_url` and capping the size."""
         kwargs.pop('allow_redirects', None)  # redirects are followed below, one checked hop at a time
+        kwargs.pop('stream', None)  # the body is streamed so that the size cap can be enforced while reading
+        max_size = cls._max_download_size()
         retries = Retry(total=cls.RETRY_TOTAL, backoff_factor=1, allowed_methods=['GET'])
         with requests.Session() as session:
             session.mount('http://', HTTPAdapter(max_retries=retries))
             session.mount('https://', HTTPAdapter(max_retries=retries))
             for _ in range(cls.MAX_REDIRECTS + 1):
                 cls.check_url(url)
-                response = session.get(url, allow_redirects=False, **kwargs)
-                if not response.is_redirect:
-                    response.raise_for_status()
-                    return response
-                location = response.headers['location']
-                response.close()
+                with session.get(url, allow_redirects=False, stream=True, **kwargs) as response:
+                    if not response.is_redirect:
+                        response.raise_for_status()
+                        return cls._read_capped(response, url, max_size)
+                    location = response.headers['location']
                 url = urljoin(url, location)
         raise ValueError(f'The URL {url!r} exceeded the limit of {cls.MAX_REDIRECTS} redirects.')
 
     @classmethod
+    def _read_capped(cls, response: requests.Response, url: str, max_size: int) -> bytes:
+        if max_size <= 0:
+            return response.content
+        content_length = response.headers.get('content-length')
+        if content_length is not None and content_length.isdigit() and int(content_length) > max_size:
+            cls._raise_too_large(url, max_size)
+        res = bytearray()
+        for chunk in response.iter_content(cls.CHUNK_SIZE):
+            res += chunk
+            # A response may omit or understate content-length, so the cap is also enforced while reading.
+            if len(res) > max_size:
+                cls._raise_too_large(url, max_size)
+        return bytes(res)
+
+    @staticmethod
+    def _raise_too_large(url: str, max_size: int) -> None:
+        raise ValueError(f'Refusing to fetch {url!r}: the response is larger than '
+                         f'{max_size / 1024 ** 2:.0f}MB. Raise or disable this cap with the environment '
+                         'variable `SWIFT_MAX_DOWNLOAD_SIZE_MB` (`0` disables it).')
+
+    @classmethod
+    def _max_download_size(cls) -> int:
+        size_mb = get_env_args('swift_max_download_size_mb', float, cls.DEFAULT_MAX_DOWNLOAD_SIZE_MB)
+        return int(size_mb * 1024**2)
+
+    @classmethod
     def check_url(cls, url: str) -> None:
         """Raise a ValueError if `url` must not be fetched on behalf of an untrusted caller."""
-        parsed = urlparse(url)
+        if not isinstance(url, str):
+            raise ValueError(f'Refusing to fetch {url!r}: the URL must be a string.')
+        if '\\' in url or any(ord(char) < 32 or ord(char) == 127 for char in url):
+            raise ValueError(f'Refusing to fetch {url!r}: ambiguous URL characters are not allowed.')
+        try:
+            # Validate the URL after applying requests' own normalization. Otherwise urllib.parse and requests
+            # can disagree about the authority (for example, a backslash before `@` can move the real host).
+            prepared_url = requests.Request('GET', url).prepare().url
+        except (requests.RequestException, UnicodeError) as e:
+            raise ValueError(f'Refusing to fetch {url!r}: the URL is invalid ({e}).') from e
+        parsed = urlparse(prepared_url)
         if parsed.scheme.lower() not in cls.ALLOWED_SCHEMES:
             raise ValueError(f'Refusing to fetch {url!r}: only '
                              f'{"/".join(scheme + "://" for scheme in cls.ALLOWED_SCHEMES)} URLs are supported.')
@@ -76,23 +117,22 @@ class SafeUrlFetcher:
         if host in cls.METADATA_HOSTS:
             cls._raise_metadata(url, f'{host!r} is a cloud instance metadata endpoint')
         allowed_hosts = cls._get_allowed_hosts()
-        if allowed_hosts is not None:
-            # An explicit allowlist is an explicit trust decision, so the address checks below are skipped.
-            if host not in allowed_hosts:
-                raise ValueError(f'Refusing to fetch {url!r}: the host {host!r} is not listed in '
-                                 'the `SWIFT_URL_ALLOWED_HOSTS` environment variable.')
-            return
+        if allowed_hosts is not None and host not in allowed_hosts:
+            raise ValueError(f'Refusing to fetch {url!r}: the host {host!r} is not listed in '
+                             'the `SWIFT_URL_ALLOWED_HOSTS` environment variable.')
+        # Resolve allowlisted hosts too: the allowlist may trust a private storage endpoint, but cloud metadata
+        # networks are never trusted, even if an IP literal or a DNS alias was accidentally put in the list.
         for ip in cls._resolve(host):
-            cls._check_ip(url, ip)
+            cls._check_ip(url, ip, allow_internal=allowed_hosts is not None)
 
     @classmethod
-    def _check_ip(cls, url: str, ip: IpAddress) -> None:
+    def _check_ip(cls, url: str, ip: IpAddress, allow_internal: bool = False) -> None:
         if getattr(ip, 'ipv4_mapped', None) is not None:
             ip = ip.ipv4_mapped  # e.g. ::ffff:169.254.169.254
         for network in cls.METADATA_NETWORKS:
             if ip.version == network.version and ip in network:
                 cls._raise_metadata(url, f'it resolves to {ip}, inside the metadata range {network}')
-        if cls._allow_internal_url():
+        if allow_internal or cls._allow_internal_url():
             return
         if not ip.is_global:
             raise ValueError(
