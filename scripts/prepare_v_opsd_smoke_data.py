@@ -5,10 +5,11 @@ import argparse
 import json
 from pathlib import Path
 
-PRIVILEGED_HINT = ('\n\nHere is a reference solution to this problem:\n'
-                   '{solution}\n\n'
-                   'After understanding the reference solution, please try to solve this '
-                   'problem using your own approach below:')
+PRIVILEGED_HINT = (
+    '\n\nHere is a reference solution to this problem:\n'
+    '{solution}\n\n'
+    'After understanding the reference solution, please try to solve this problem using your own approach below. '
+    'Explain briefly if useful, then put only the final option in \\boxed{{...}}.')
 
 
 def resolve_media_paths(paths: list[str], source_dir: Path) -> list[str]:

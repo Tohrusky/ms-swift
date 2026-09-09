@@ -9,6 +9,7 @@ NPROC_PER_NODE=4 \
 uv run --no-sync swift rlhf \
     --rlhf_type gkd \
     --model Qwen/Qwen3.5-4B \
+    --teacher_model Qwen/Qwen3.5-4B \
     --enable_thinking false \
     --tuner_type full \
     --torch_dtype bfloat16 \
@@ -24,10 +25,11 @@ uv run --no-sync swift rlhf \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 1 \
     --num_train_epochs 1 \
-    --learning_rate 1e-6 \
+    --learning_rate 2e-6 \
     --save_steps 100 \
     --save_total_limit 10 \
     --logging_steps 1 \
+    --log_completions true \
     --max_length 64000 \
     --max_completion_length 4096 \
     --save_only_model true \
