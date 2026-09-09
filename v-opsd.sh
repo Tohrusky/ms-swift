@@ -1,20 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$PROJECT_DIR"
+
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 NPROC_PER_NODE=4 \
 uv run --no-sync swift rlhf \
     --rlhf_type gkd \
-    --model Qwen/Qwen3.5-2B \
+    --model Qwen/Qwen3.5-4B \
+    --enable_thinking false \
     --tuner_type full \
     --torch_dtype bfloat16 \
     --use_vllm true \
     --vllm_mode colocate \
     --vllm_gpu_memory_utilization 0.35 \
     --vllm_max_model_len 64000 \
-    --dataset smoke_training/train.jsonl \
+    --dataset smoke_training_data/train.jsonl \
     --lmbda 1.0 \
     --beta 0.5 \
     --temperature 1.0 \
     --sft_alpha 0 \
-    --torch_dtype bfloat16 \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 1 \
     --num_train_epochs 1 \
